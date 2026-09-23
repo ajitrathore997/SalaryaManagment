@@ -64,11 +64,29 @@ cd backend
 npm run db:generate
 ```
 
-### 4. Run database migrations (once a schema is defined)
+### 4. Run database migrations
 
 ```bash
-npm run db:migrate
+npm run db:migrate --workspace=backend
 ```
+
+### 5. Seed the database
+
+Populates the database with 10,000 deterministic employees and one HR Manager account for development and assessment use.
+
+```bash
+npm run db:seed --workspace=backend
+```
+
+The seed is **idempotent** — safe to run multiple times. It always produces the same logical dataset.
+
+> ⚠️ **Assessment demo credentials** — for local development only. Never use in production.
+>
+> | Field    | Value                        |
+> |----------|------------------------------|
+> | Email    | `hr.manager@salaryapp.dev`   |
+> | Password | `HRdemo2026!`                |
+> | Role     | `HR_MANAGER`                 |
 
 ---
 
@@ -145,6 +163,12 @@ npm run format:check --workspace=frontend
 ## Database tooling
 
 ```bash
+# Run migrations
+npm run db:migrate --workspace=backend
+
+# Seed database (10,000 employees + HR Manager demo account)
+npm run db:seed --workspace=backend
+
 # Open Prisma Studio (visual DB browser)
 npm run db:studio --workspace=backend
 ```

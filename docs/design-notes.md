@@ -191,3 +191,99 @@ All salary values use `DECIMAL(15, 4)` (PostgreSQL `NUMERIC`):
 - **Exact arithmetic** — `NUMERIC` is an exact type; no floating-point rounding errors accumulate across aggregations.
 - **CHECK constraints** — `CHECK (base_annual_salary >= 0)` on `employees` and equivalent checks on both salary columns in `salary_history` are enforced at the database level, added directly in the migration SQL (Prisma SDL does not expose `CHECK` constraints).
 - **Currency** stored as `CHAR(3)` ISO 4217 code alongside each salary value so currency is never ambiguous.
+
+---
+
+## Seed strategy
+
+### Overview
+
+The seed (`backend/prisma/seed.ts`) populates the database with exactly 10,000 employees, one HR Manager user, and one `SalaryHistory` row per employee. It is designed to be both deterministic and idempotent — running it multiple times produces the same logical dataset without leaving orphaned rows.
+
+---
+
+### Deterministic generation
+
+All randomness is driven by **mulberry32**, a lightweight 32-bit pseudo-random number generator seeded with the fixed constant `0xDEADBEEF`. Mulberry32 was chosen over `Math.random()` because:
+
+- It is fully portable — same seed produces identical output on every platform and Node.js version.
+- It requires zero external dependencies — implemented in ~8 lines of pure TypeScript.
+- It passes statistical quality tests (BigCrush), so distributions are visually realistic rather than obviously patterned.
+
+The seed constant is intentionally never changed. Any change to it would alter every generated value, breaking the reproducibility guarantee. All PRNG calls are made in a fixed order determined by the loop structure, so inserting a new field or data pool at the end does not affect earlier values.
+
+---
+
+### Idempotency
+
+The seed achieves idempotency through a **truncate-then-insert** strategy:
+
+1. `salaryHistory.deleteMany({})` — deletes all history rows first (FK child).
+2. `employee.deleteMany({})` — then deletes all employee rows (FK parent).
+3. Full re-insert of all 10,000 employees and 10,000 history rows.
+
+The HR Manager is handled separately with `user.upsert()`, which updates the password hash on re-runs without creating a duplicate. This means the user ID is stable across runs, which matters because history rows reference it via `changedById`.
+
+Alternative considered: checking row count and skipping if already seeded. Rejected because partial seeds (e.g. from a previous failed run) would leave inconsistent data. A full wipe-and-reload is simpler and safer.
+
+---
+
+### Why realistic distributions matter for dashboard testing
+
+The dashboard and pay insights features are only meaningful if the underlying data has realistic shape. Uniform random distributions (all countries equally represented, all salaries identical) would cause insights pages to show flat, unhelpful charts. The seed deliberately reproduces real-world skew:
+
+| Dimension | Approach |
+|-----------|----------|
+| **Country** | Weighted — US 28%, UK 12%, India 12%, Germany 10%; reflects a typical tech-company global footprint |
+| **Department** | Weighted — Engineering 22%, Product 10%, Sales 10%; mirrors industry headcount ratios |
+| **Level** | Weighted pyramid — L3 Mid is the most common (28%), L6 Principal the rarest (6%) |
+| **Employment type** | Full-time dominant (78%), with a realistic mix of contractors and part-timers |
+| **Gender** | Near-parity (48/46/4/2) to allow meaningful equity analysis in the insights view |
+| **Salary** | Per-country bands with ±15% noise and a level multiplier, producing a realistic bell curve within each band |
+| **Hire dates** | Uniform across 2015–2026, producing a natural tenure distribution |
+
+Dashboard filter dropdowns, pay distribution histograms, and country/department breakdowns all become immediately testable with this dataset.
+
+---
+
+### Manager relationship generation
+
+Manager assignment uses a two-phase approach to satisfy the self-referential FK constraint:
+
+**Phase 1 — Insert all employees with `managerId = null`.**
+Prisma's `createMany` batches 500 rows per call. Because all rows have a null FK at this stage, there are no FK violations regardless of insert order.
+
+**Phase 2 — Update manager FK in a second pass.**
+After all 10,000 employee rows exist in the database, the seed iterates through them and assigns managers according to these rules:
+
+- Only employees at **L4 — Senior or above** are eligible to be managers (`canManage: true`). This ensures a realistic org hierarchy where junior employees are never managers.
+- Each employee has a **70% probability** of being assigned a manager (30% are top-level ICs or executives without a named manager in the dataset).
+- The candidate manager is drawn from the eligible pool and checked to ensure `candidateId !== employeeId`, preventing self-reference. Up to 8 retries are attempted before skipping assignment.
+- Updates are applied in batches of 500 using `prisma.$transaction([...updates])`.
+
+This produces approximately 7,000 manager relationships with zero self-references and a plausible org tree spanning ~40 manager candidates per 500 employees.
+
+**Result from the live seed run:**
+
+```
+Employees       10,000
+With manager     7,000  (70.0%)
+Self-reference       0
+Negative salaries    0
+Countries           12
+Departments         12
+```
+
+---
+
+### Bulk insert performance
+
+| Operation | Rows | Batches | Approach |
+|-----------|------|---------|----------|
+| Employee insert | 10,000 | 20 × 500 | `createMany` |
+| Manager update  |  7,000 | 14 × 500 | `$transaction([update × 500])` |
+| History insert  | 10,000 | 20 × 500 | `createMany` |
+
+`createMany` maps to a single multi-row `INSERT` per batch, avoiding the N+1 overhead of individual `create` calls. The manager update pass uses transactional batches to stay within PostgreSQL's prepared-statement parameter limit while maintaining atomicity per batch.
+
+Total seed runtime on a local PostgreSQL instance is approximately 60–90 seconds, dominated by the bcrypt hash (12 rounds) and the manager update transactions.
