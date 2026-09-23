@@ -287,3 +287,85 @@ Departments         12
 `createMany` maps to a single multi-row `INSERT` per batch, avoiding the N+1 overhead of individual `create` calls. The manager update pass uses transactional batches to stay within PostgreSQL's prepared-statement parameter limit while maintaining atomicity per batch.
 
 Total seed runtime on a local PostgreSQL instance is approximately 60–90 seconds, dominated by the bcrypt hash (12 rounds) and the manager update transactions.
+
+---
+
+## Testing strategy
+
+### Philosophy
+
+Tests exist to catch regressions, document intent, and give the team confidence when changing the codebase. The guiding principles for this project are:
+
+- **Test through application abstractions** — tests use the same `PrismaClient` instance and the same seed script that the application itself uses, never reimplementing logic inline. If the schema changes, the test fails; if the seed changes, the test catches it.
+- **Prefer integration over unit for data concerns** — the database schema, constraints, and seed are a single cohesive system. Mocking the database would test the mock, not the system.
+- **Keep tests deterministic** — all tests query a seeded dataset produced by a fixed-seed PRNG. The same database state always produces the same pass/fail result.
+- **Clean up after constraint tests** — tests that insert rows to verify constraints immediately delete them so they do not pollute counts checked by other tests. Test IDs use a recognisable `test_*` prefix for easy identification.
+
+---
+
+### Test layers
+
+| Layer | File | Tool | Touches DB |
+|-------|------|------|------------|
+| HTTP integration | `tests/health.test.ts` | Vitest + Supertest | No |
+| Database integration | `tests/database.test.ts` | Vitest + Prisma | Yes (real) |
+
+The two layers run in the same `vitest run` invocation but are completely independent — the HTTP tests use a dummy `DATABASE_URL` and never open a connection; the database tests use the real connection string from `backend/.env`.
+
+---
+
+### Test environment setup
+
+`tests/setup.ts` is loaded by Vitest as a `setupFiles` entry before any test file runs. It calls `dotenv.config()` pointing at `backend/.env`, making `DATABASE_URL` and other variables available to the database tests. The health tests override `DATABASE_URL` with a placeholder at the top of their own file, which is safe because `dotenv.config()` does not overwrite already-set environment variables.
+
+---
+
+### Database test coverage
+
+| # | Describe block | What is verified |
+|---|---------------|------------------|
+| 1 | **HR Manager account** | User exists, role is `HR_MANAGER`, password is a valid bcrypt hash (`$2b$`), plaintext password is not stored |
+| 2 | **Employee count** | Exactly 10,000 employees are present |
+| 3 | **Email uniqueness** | No duplicate emails (`GROUP BY … HAVING COUNT > 1`); every email contains `@` |
+| 4 | **Salary validity** | No employee has a salary ≤ 0; all currency codes are exactly 3 characters; all codes are from the known ISO 4217 set used by the seed; minimum salary is > 0 |
+| 5 | **SalaryHistory — initial hire entries** | `salary_history` row count equals employee count; every employee has ≥ 1 history row; all initial rows have `previousSalary = null` and `previousCurrency = null`; `newSalary` and `newCurrency` match the employee's current values; `effectiveDate` matches `hireDate` |
+| 6 | **SalaryHistory FK integrity** | No orphaned history rows (left-join check against `employees`); no orphaned `changedById` (left-join check against `users`); every history row was authored by the seeded HR Manager |
+| 7 | **Manager relationships** | No employee is their own manager (raw SQL `WHERE managerId = id`); every non-null `managerId` references a real employee row; all managers are at L4 — Senior or above; manager assignment rate is between 60% and 80% |
+| 8 | **Seed idempotency** | Running the seed a second time (via `execSync`) produces the same employee count; the HR Manager `id` is unchanged (upsert, not re-create); no duplicate user rows; `salary_history` count re-equals employee count |
+| 9 | **Negative salary constraint** | ORM `create` with `baseAnnualSalary: -1` throws; raw `INSERT` with `newSalary = -500` throws (DB-level `CHECK`); zero salary is accepted (boundary); positive salary is accepted (positive control) |
+
+---
+
+### What is deliberately not tested here
+
+| Concern | Reason |
+|---------|--------|
+| Authentication / JWT | Not implemented yet — will be covered in the auth test suite |
+| API endpoints | Not implemented yet |
+| Frontend components | Covered by frontend Vitest suite when added |
+| Prisma migration correctness | Verified by `prisma validate` and `prisma migrate dev` at schema time; the resulting DB structure is implicitly tested by every query in the database suite |
+| PRNG output distribution | Statistical tests are out of scope; visual inspection of seeded data and weighted-pick logic is sufficient at this scale |
+
+---
+
+### Running the tests
+
+```bash
+# Prerequisites: database must be migrated and seeded first
+npm run db:migrate --workspace=backend
+npm run db:seed   --workspace=backend
+
+# Run the full test suite (single pass)
+npm run test
+
+# Run with coverage report
+npm run test:coverage --workspace=backend
+```
+
+The database test suite takes approximately 15–20 seconds — the bulk of the time is the idempotency test, which re-runs the seed script (bcrypt hashing + 30 batched inserts).
+
+---
+
+### Timeout configuration
+
+`vitest.config.ts` sets `testTimeout` and `hookTimeout` to 120 seconds. This accommodates the idempotency test's seed re-run (which includes bcrypt at 12 rounds and ~30 `createMany` + transaction batches) while still failing loudly if something genuinely hangs.
