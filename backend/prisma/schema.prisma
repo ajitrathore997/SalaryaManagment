@@ -1,0 +1,11 @@
+// Prisma schema for Salary Management Application
+// Business models will be added in subsequent development phases.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
