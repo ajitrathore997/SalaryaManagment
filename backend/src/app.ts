@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 import { env } from './config/env';
 import healthRouter from './routes/health';
 import authRouter from './routes/auth';
+import employeesRouter from './routes/employees';
 import { errorHandler } from './middleware/errorHandler';
 import { notFound } from './middleware/notFound';
 
@@ -42,6 +43,7 @@ const authLimiter = rateLimit({
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/health', healthRouter);
 app.use('/api/auth', authLimiter, authRouter);
+app.use('/api/employees', employeesRouter);
 
 // ── Error handling ───────────────────────────────────────────────────────────
 app.use(notFound);

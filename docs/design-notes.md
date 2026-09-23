@@ -511,3 +511,153 @@ All auth errors follow the project-wide format:
 ```
 
 Validation errors additionally include an `errors` field with per-field details (from Zod). `500` errors suppress the original message to prevent internal detail leakage.
+
+---
+
+## Employee read API design
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/employees` | Paginated, filtered, searchable employee list |
+| `GET` | `/api/employees/:id` | Single employee detail with current salary |
+| `GET` | `/api/employees/:id/salary-history` | Complete salary audit trail for one employee |
+
+All three endpoints require `HR_MANAGER` authentication (httpOnly JWT cookie).
+
+---
+
+### Error response shape
+
+Employee routes use the structured `ApiError` shape, distinct from the simpler `AppError` shape used by auth routes. Both are handled by the central `errorHandler`.
+
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Employee with id 'xyz' not found",
+    "details": {}
+  }
+}
+```
+
+Error codes in use: `NOT_FOUND` (404), `BAD_REQUEST` (400), `UNAUTHORIZED` (401), `FORBIDDEN` (403).
+
+The two-shape approach preserves backward compatibility with existing auth routes while providing richer, machine-readable error codes on data endpoints.
+
+---
+
+### Pagination
+
+Offset-based pagination was chosen over cursor-based for this use case:
+
+- HR Managers need to jump to arbitrary pages ("show me page 5 of 400") — cursors make this impossible without replaying the full result set.
+- At 10,000 employees with proper indexes, offset performance is entirely acceptable. Cursor pagination is warranted when tables grow into the millions and deep offsets become slow.
+
+| Parameter | Type | Default | Constraint | Notes |
+|-----------|------|---------|------------|-------|
+| `page` | integer | `1` | ≥ 1 | 1-indexed |
+| `pageSize` | integer | `25` | 1 – 100 | Hard cap prevents runaway memory usage |
+
+The hard cap of 100 rows is enforced by Zod before any DB query executes. Requests with `pageSize > 100` receive a `400 BAD_REQUEST` immediately. This eliminates the possibility of an authenticated user accidentally or deliberately fetching all 10,000 rows in one HTTP call.
+
+**Pagination metadata** is always returned alongside data:
+
+```json
+{
+  "pagination": {
+    "total": 10000,
+    "page": 2,
+    "pageSize": 25,
+    "totalPages": 400,
+    "hasNextPage": true,
+    "hasPreviousPage": true
+  }
+}
+```
+
+`total` and `data` are fetched in **parallel** (`Promise.all`) using the same `WHERE` clause, avoiding a sequential double-query penalty.
+
+---
+
+### Search
+
+`?search=<term>` performs a case-insensitive `ILIKE` match (Prisma `mode: 'insensitive'`, maps to PostgreSQL `ILIKE`) across two fields:
+
+- `employees.name`
+- `employees.email`
+
+An employee matches if *either* field contains the search term. This uses Prisma's `OR` compound. An empty or absent `search` parameter is treated as no search — the full dataset is returned subject to other active filters.
+
+`search` is limited to 200 characters by Zod to prevent oversized ILIKE patterns from being passed to the database.
+
+---
+
+### Filters
+
+All filters are **AND-composed**: every supplied filter must match for a row to be returned. Filters use case-insensitive equality (`mode: 'insensitive'`) so `?country=united+states` and `?country=United+States` return the same results.
+
+| Parameter | DB column | Match type |
+|-----------|-----------|------------|
+| `country` | `employees.country` | Case-insensitive equals |
+| `department` | `employees.department` | Case-insensitive equals |
+| `jobTitle` | `employees.jobTitle` | Case-insensitive equals |
+| `level` | `employees.level` | Case-insensitive equals |
+| `employmentType` | `employees.employmentType` | Exact enum match (validated by Zod) |
+
+All filter columns except `employmentType` are indexed in the schema, so filtered queries skip full-table scans at 10,000 rows.
+
+---
+
+### Sorting
+
+| Parameter | Allowed values | Default |
+|-----------|---------------|---------|
+| `sortBy` | `name`, `email`, `country`, `department`, `level`, `baseAnnualSalary`, `hireDate`, `createdAt` | `name` |
+| `sortOrder` | `asc`, `desc` | `asc` |
+
+Both parameters are validated by Zod enums. Unrecognised values return `400 BAD_REQUEST` immediately rather than falling through to a Prisma error.
+
+---
+
+### Query efficiency — no N+1
+
+The list endpoint uses a shared `EMPLOYEE_SELECT` constant that includes the manager relation as a nested `select`:
+
+```typescript
+manager: { select: { id: true, name: true, jobTitle: true } }
+```
+
+This resolves manager names in a **single query with a JOIN** rather than issuing a separate lookup per employee. Prisma generates one `LEFT JOIN` against the `employees` table for the self-referential relation.
+
+The `count()` and `findMany()` calls for the list share the same `WHERE` clause and run in `Promise.all` — two parallel round-trips rather than two sequential ones.
+
+---
+
+### Salary history ordering
+
+`GET /api/employees/:id/salary-history` returns rows ordered by:
+
+1. `effectiveDate DESC` — most recent salary change first, matching how HR Managers read history ("what changed most recently?")
+2. `createdAt DESC` — tie-breaker for multiple changes on the same effective date (e.g. a correction applied the same day)
+
+`previousSalary` and `previousCurrency` are `null` on the first-ever history row (the initial hire entry), which is always the last row in the descending list. This is the canonical signal that no prior compensation existed.
+
+---
+
+### `GET /api/employees/:id` — detail vs list
+
+The detail endpoint reuses the same `EMPLOYEE_SELECT` shape as the list, ensuring the field set is identical between the two views. This consistency means the frontend never needs separate serialisers for list cards and detail panels. The only difference is that the detail endpoint returns a single object rather than an array.
+
+---
+
+### What is deliberately not implemented here
+
+| Feature | Status |
+|---------|--------|
+| Salary editing / update | Next phase |
+| Bulk import via CSV | Future phase |
+| Export to CSV/Excel | Future phase |
+| Employee creation / deletion | Future phase |
+| Aggregated pay insights | Future phase |
