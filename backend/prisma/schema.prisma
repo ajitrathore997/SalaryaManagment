@@ -1,5 +1,20 @@
-// Prisma schema for Salary Management Application
-// Business models will be added in subsequent development phases.
+// =============================================================================
+// Salary Management — Prisma Schema
+// =============================================================================
+// Design decisions:
+//   - Monetary values use Decimal (maps to PostgreSQL NUMERIC) to avoid
+//     floating-point errors. Scale of 4 supports sub-cent precision.
+//   - Employee stores the current salary for O(1) reads without joining history.
+//   - SalaryHistory is the append-only audit trail for every salary change.
+//     It captures previous AND new state so any point-in-time can be derived.
+//   - No generic AuditLog table — salary change auditing requirements are
+//     fully met by SalaryHistory with typed fields and no schema sprawl.
+//   - Employee.version supports optimistic concurrency: API callers pass the
+//     version they read; the update is rejected if it has since incremented.
+//   - Static organisational fields (country, department, jobTitle, level) are
+//     plain strings rather than normalised lookup tables — keeping the schema
+//     lean and queries simple at the 10 k-employee scale targeted.
+// =============================================================================
 
 generator client {
   provider = "prisma-client-js"
@@ -8,4 +23,130 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  HR_MANAGER
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERN
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  NON_BINARY
+  PREFER_NOT_TO_SAY
+}
+
+// ---------------------------------------------------------------------------
+// User
+// HR Manager accounts that can authenticate and operate the platform.
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(HR_MANAGER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Salary changes authored by this user
+  salaryChanges SalaryHistory[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Employee
+// Represents one employee in the organisation.
+// Current compensation is stored directly for efficient reads.
+// ---------------------------------------------------------------------------
+
+model Employee {
+  id             String         @id @default(cuid())
+  name           String
+  email          String         @unique
+  country        String
+  department     String
+  jobTitle       String
+  level          String
+  hireDate       DateTime       @db.Date
+  employmentType EmploymentType
+  gender         Gender
+
+  // Current compensation — kept in sync on every salary change.
+  // NUMERIC(15,4) avoids floating-point errors; scale of 4 covers
+  // currencies with sub-cent precision (e.g. KWD = 3 decimal places).
+  baseAnnualSalary Decimal @db.Decimal(15, 4)
+  salaryCurrency   String  @db.Char(3) // ISO 4217 currency code
+
+  // Self-referential manager relationship
+  managerId String?
+  manager   Employee?  @relation("EmployeeManager", fields: [managerId], references: [id])
+  reports   Employee[] @relation("EmployeeManager")
+
+  // Optimistic concurrency version — incremented on every update.
+  // API layer checks: UPDATE ... WHERE id = ? AND version = ? then increments.
+  version Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salaryHistory SalaryHistory[]
+
+  // ── Indexes ───────────────────────────────────────────────────────────────
+  // email index is covered by the @unique constraint above.
+  @@index([country])
+  @@index([department])
+  @@index([jobTitle])
+  @@index([managerId])
+  @@map("employees")
+}
+
+// ---------------------------------------------------------------------------
+// SalaryHistory
+// Append-only audit trail for every salary change on an employee.
+// Each row captures full before/after state so any historical view can be
+// reconstructed without depending on adjacent rows.
+// ---------------------------------------------------------------------------
+
+model SalaryHistory {
+  id String @id @default(cuid())
+
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  // Previous state — null only on the first-ever salary record (initial hire).
+  previousSalary   Decimal? @db.Decimal(15, 4)
+  previousCurrency String?  @db.Char(3)
+
+  // New (current after this change) state.
+  newSalary   Decimal @db.Decimal(15, 4)
+  newCurrency String  @db.Char(3)
+
+  effectiveDate DateTime @db.Date
+
+  // Human-readable reason for the change (e.g. "Annual review", "Promotion").
+  reason String?
+
+  // The HR Manager who made the change.
+  changedById String
+  changedBy   User   @relation(fields: [changedById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  // Composite index — most common query pattern: all changes for an employee
+  // ordered by date, or changes since a given effective date.
+  @@index([employeeId, effectiveDate])
+  @@map("salary_history")
 }

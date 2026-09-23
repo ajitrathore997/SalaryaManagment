@@ -13,8 +13,8 @@ build/
 .env.local
 .env.*.local
 
-# Prisma
-backend/prisma/migrations/
+# Prisma — generated client is rebuilt from schema, never committed
+# Migrations ARE committed (they are the source of truth for DB history)
 
 # Logs
 logs/
