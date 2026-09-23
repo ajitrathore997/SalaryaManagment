@@ -16,11 +16,13 @@ import { ApiError } from '../middleware/errorHandler';
 import {
   employeeListQuerySchema,
   employeeIdParamSchema,
+  salaryUpdateSchema,
 } from '../schemas/employee.schema';
 import {
   listEmployees,
   findEmployeeById,
   getEmployeeSalaryHistory,
+  updateSalary,
 } from '../services/employee.service';
 
 const router = Router();
@@ -103,6 +105,46 @@ router.get(
         status: 'ok',
         data: history,
         meta: { employeeId: paramResult.data.id, count: history.length },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ── PATCH /api/employees/:id/salary ──────────────────────────────────────────
+
+router.patch(
+  '/:id/salary',
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const paramResult = employeeIdParamSchema.safeParse(req.params);
+      if (!paramResult.success) {
+        return void next(ApiError.badRequest('Invalid employee id'));
+      }
+
+      const bodyResult = salaryUpdateSchema.safeParse(req.body);
+      if (!bodyResult.success) {
+        return void next(
+          ApiError.badRequest('Invalid salary update input', {
+            fields: bodyResult.error.flatten().fieldErrors,
+          }),
+        );
+      }
+
+      // req.user is guaranteed by the router-level requireAuth middleware
+      const changedById = req.user!.sub;
+
+      const { updatedEmployee, historyEntry } = await updateSalary(
+        paramResult.data.id,
+        bodyResult.data,
+        changedById,
+      );
+
+      res.status(200).json({
+        status: 'ok',
+        data:   updatedEmployee,
+        history: historyEntry,
       });
     } catch (err) {
       next(err);

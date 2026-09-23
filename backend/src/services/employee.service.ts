@@ -16,7 +16,8 @@
 
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
-import { EmployeeListQuery } from '../schemas/employee.schema';
+import { EmployeeListQuery, SalaryUpdateInput } from '../schemas/employee.schema';
+import { ApiError } from '../middleware/errorHandler';
 
 // ── Shared select shape — used by list and detail to keep responses consistent ─
 
@@ -141,5 +142,102 @@ export async function getEmployeeSalaryHistory(employeeId: string): Promise<Sala
     select: HISTORY_SELECT,
     // Most recent change first; createdAt breaks ties within the same date
     orderBy: [{ effectiveDate: 'desc' }, { createdAt: 'desc' }],
+  });
+}
+
+// ── Salary update ─────────────────────────────────────────────────────────────
+
+export interface SalaryUpdateResult {
+  updatedEmployee: EmployeeRow;
+  historyEntry: SalaryHistoryRow;
+}
+
+/**
+ * Update an employee's salary atomically.
+ *
+ * Optimistic concurrency is enforced via the `version` field:
+ *   UPDATE employees SET ... version = version + 1
+ *   WHERE id = ? AND version = ?
+ *
+ * If the WHERE clause matches 0 rows the version was stale (or the employee
+ * was deleted). We disambiguate with a follow-up findUnique:
+ *   - employee not found → throw NOT_FOUND
+ *   - employee found but version differs → throw SALARY_VERSION_CONFLICT (409)
+ *
+ * Both the employee UPDATE and SalaryHistory INSERT run inside a single
+ * Prisma interactive transaction so they are committed or rolled back together.
+ */
+export async function updateSalary(
+  employeeId: string,
+  input: SalaryUpdateInput,
+  changedById: string,
+): Promise<SalaryUpdateResult> {
+  return prisma.$transaction(async (tx) => {
+    // ── Step 1: version-checked UPDATE ────────────────────────────────────────
+    // updateMany returns a count — 0 means either not found or version mismatch
+    const updated = await tx.employee.updateMany({
+      where: { id: employeeId, version: input.version },
+      data: {
+        baseAnnualSalary: input.salary,
+        salaryCurrency:   input.currency,
+        version:          { increment: 1 },
+      },
+    });
+
+    if (updated.count === 0) {
+      // Disambiguate: does the employee exist at all?
+      const existing = await tx.employee.findUnique({
+        where:  { id: employeeId },
+        select: { id: true, version: true },
+      });
+
+      if (!existing) {
+        throw ApiError.notFound('Employee', employeeId);
+      }
+
+      // Employee exists but version doesn't match → optimistic concurrency conflict
+      throw new ApiError(
+        409,
+        'SALARY_VERSION_CONFLICT',
+        'The salary was updated by another request. Refresh the employee record and try again.',
+        {
+          suppliedVersion: input.version,
+          currentVersion:  existing.version,
+        },
+      );
+    }
+
+    // ── Step 2: fetch previous salary from the most recent history record ──────
+    // We need the previous values to populate SalaryHistory correctly.
+    // After the UPDATE the employee row has the new salary, so we look at the
+    // most recent history entry (the one before this change).
+    const previousHistory = await tx.salaryHistory.findFirst({
+      where:   { employeeId },
+      orderBy: [{ effectiveDate: 'desc' }, { createdAt: 'desc' }],
+      select:  { newSalary: true, newCurrency: true },
+    });
+
+    // ── Step 3: insert SalaryHistory row ──────────────────────────────────────
+    const historyEntry = await tx.salaryHistory.create({
+      data: {
+        employeeId,
+        previousSalary:   previousHistory?.newSalary   ?? null,
+        previousCurrency: previousHistory?.newCurrency ?? null,
+        newSalary:        input.salary,
+        newCurrency:      input.currency,
+        effectiveDate:    input.effectiveDate,
+        reason:           input.reason,
+        changedById,
+      },
+      select: HISTORY_SELECT,
+    });
+
+    // ── Step 4: return the refreshed employee record ───────────────────────────
+    const updatedEmployee = await tx.employee.findUniqueOrThrow({
+      where:  { id: employeeId },
+      select: EMPLOYEE_SELECT,
+    });
+
+    return { updatedEmployee, historyEntry };
   });
 }

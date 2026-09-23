@@ -79,3 +79,62 @@ export const employeeIdParamSchema = z.object({
 });
 
 export type EmployeeIdParam = z.infer<typeof employeeIdParamSchema>;
+
+// ── Supported currencies ──────────────────────────────────────────────────────
+// Matches the ISO 4217 codes used in the seed data.
+// Adding a new currency here automatically enables it for validation.
+
+export const SUPPORTED_CURRENCIES = [
+  'USD', 'GBP', 'EUR', 'CAD', 'AUD',
+  'INR', 'SGD', 'BRL', 'MXN', 'JPY',
+] as const;
+
+export type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
+
+// ── Salary update body ────────────────────────────────────────────────────────
+
+export const salaryUpdateSchema = z.object({
+  // Salary: non-negative decimal accepted as number or numeric string
+  salary: z
+    .union([z.number(), z.string()])
+    .transform((v) => (typeof v === 'string' ? parseFloat(v) : v))
+    .pipe(
+      z
+        .number({ invalid_type_error: 'salary must be a number' })
+        .nonnegative('salary must not be negative')
+        .finite('salary must be a finite number'),
+    ),
+
+  // Currency: must be one of the application's supported ISO 4217 codes
+  currency: z.enum(SUPPORTED_CURRENCIES, {
+    errorMap: () => ({
+      message: `currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
+    }),
+  }),
+
+  // effectiveDate: ISO 8601 date string (YYYY-MM-DD); coerced to Date
+  effectiveDate: z
+    .string({ required_error: 'effectiveDate is required' })
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'effectiveDate must be a date in YYYY-MM-DD format')
+    .transform((s) => new Date(s))
+    .pipe(
+      z.date().refine((d) => !isNaN(d.getTime()), {
+        message: 'effectiveDate is not a valid date',
+      }),
+    ),
+
+  // reason: mandatory human-readable description of the change
+  reason: z
+    .string({ required_error: 'reason is required' })
+    .trim()
+    .min(1, 'reason must not be empty')
+    .max(500, 'reason must be ≤ 500 characters'),
+
+  // version: optimistic concurrency token — must match the current DB version
+  version: z
+    .number({ required_error: 'version is required', invalid_type_error: 'version must be a number' })
+    .int('version must be an integer')
+    .min(1, 'version must be ≥ 1'),
+});
+
+export type SalaryUpdateInput = z.infer<typeof salaryUpdateSchema>;
