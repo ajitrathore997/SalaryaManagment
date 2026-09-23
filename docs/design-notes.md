@@ -369,3 +369,145 @@ The database test suite takes approximately 15–20 seconds — the bulk of the 
 ### Timeout configuration
 
 `vitest.config.ts` sets `testTimeout` and `hookTimeout` to 120 seconds. This accommodates the idempotency test's seed re-run (which includes bcrypt at 12 rounds and ~30 `createMany` + transaction batches) while still failing loudly if something genuinely hangs.
+
+---
+
+## Authentication and security design
+
+### Overview
+
+Authentication is implemented as three stateless HTTP endpoints mounted at `/api/auth`. A JWT is issued on successful login and stored exclusively in an `httpOnly` cookie — it is never returned in the response body or accessible to frontend JavaScript.
+
+---
+
+### Endpoints
+
+| Method | Path | Auth required | Description |
+|--------|------|--------------|-------------|
+| `POST` | `/api/auth/login` | No | Validates credentials, issues JWT cookie |
+| `GET` | `/api/auth/me` | Yes | Returns the authenticated user's profile |
+| `POST` | `/api/auth/logout` | No | Clears the auth cookie |
+
+---
+
+### Request flow
+
+```
+Client                          Express                        PostgreSQL
+  │                                │                               │
+  │  POST /api/auth/login          │                               │
+  │  { email, password }  ────────>│                               │
+  │                                │  Zod validate input           │
+  │                                │  findUnique(email)  ─────────>│
+  │                                │<─────────────────────────────  │
+  │                                │  bcrypt.compare(pw, hash)     │
+  │                                │  jwt.sign(payload)            │
+  │<───────────────────────────────│  Set-Cookie: auth_token=JWT   │
+  │  200 { user: {id,email,role} } │  (httpOnly, SameSite=Strict)  │
+  │                                │                               │
+  │  GET /api/auth/me              │                               │
+  │  Cookie: auth_token=JWT ──────>│                               │
+  │                                │  requireAuth middleware        │
+  │                                │  jwt.verify(token, secret)    │
+  │                                │  findUnique(userId)  ────────>│
+  │                                │<─────────────────────────────  │
+  │<───────────────────────────────│                               │
+  │  200 { user: {id,email,role} } │                               │
+```
+
+---
+
+### Cookie security
+
+| Attribute | Value | Reason |
+|-----------|-------|--------|
+| `HttpOnly` | `true` | Prevents JavaScript from reading the token — mitigates XSS token theft |
+| `SameSite` | `Strict` | Blocks the cookie from being sent on cross-site requests — mitigates CSRF |
+| `Secure` | `true` in production, `false` in development | Requires HTTPS in production; allows plain HTTP in local dev |
+| `Path` | `/` | Cookie applies to all routes |
+| `MaxAge` | Derived from `JWT_EXPIRES_IN` (default `7d`) | Cookie and token expire together |
+
+The JWT is **never** included in the response body. Frontend JavaScript can call `/api/auth/me` to determine session state; it has no direct access to the token string.
+
+---
+
+### JWT design
+
+- **Algorithm**: HS256 (HMAC-SHA256) — symmetric, appropriate for a single-server deployment.
+- **Secret**: read from `JWT_SECRET` env var, validated at startup to be ≥ 32 characters by Zod.
+- **Payload**: `{ sub: userId, email, role }` — minimal, no sensitive data.
+- **Expiry**: `JWT_EXPIRES_IN` (default `7d`), stored in cookie `MaxAge` so both expire simultaneously.
+- Secrets are **never hard-coded**. `env.ts` calls `process.exit(1)` at startup if `JWT_SECRET` is absent or too short.
+
+---
+
+### Password security
+
+- Passwords are hashed with **bcrypt** (12 rounds) — never stored or logged in plaintext.
+- Login compares the submitted password against the stored hash using `bcrypt.compare()`.
+- When an email does not exist, a **dummy bcrypt compare is still executed** against a fixed invalid hash. This maintains near-constant response time and prevents timing-based email enumeration — a timing attack could otherwise identify valid emails by measuring the response latency difference between "user not found" (fast) and "wrong password" (bcrypt-delayed).
+
+---
+
+### Email enumeration protection
+
+Both "wrong password" and "unknown email" scenarios return **identical** HTTP status (`401`) and message (`"Invalid email or password"`). There is no way for a caller to distinguish the two cases from the API response.
+
+---
+
+### Input validation
+
+Login input is validated with a **Zod schema** before any database query:
+
+- `email`: required, valid email format, normalised to lowercase and trimmed.
+- `password`: required, non-empty string.
+
+Validation errors return `400` with the project's standard `{ status: 'error', message: 'Validation failed', errors: {...} }` shape.
+
+---
+
+### Authentication middleware
+
+`requireAuth` (`src/middleware/requireAuth.ts`):
+
+1. Reads `req.cookies.auth_token`.
+2. Returns `401` immediately if the cookie is absent.
+3. Calls `verifyToken()` — returns `null` on expired or malformed JWTs.
+4. If invalid, **clears the stale cookie** and returns `401`. This prevents the browser from holding an expired token indefinitely.
+5. On success, attaches the decoded payload to `req.user` and calls `next()`.
+
+`requireRole(role)` composes after `requireAuth` to enforce a specific role. Currently only `HR_MANAGER` exists; the pattern is extensible without structural changes.
+
+---
+
+### Rate limiting
+
+Login attempts are rate-limited with **`express-rate-limit`** (in-memory store):
+
+| Setting | Value | Reasoning |
+|---------|-------|-----------|
+| Window | 15 minutes | Standard brute-force window |
+| Max requests | 10 per IP | Allows a few genuine retries; tightly bounds automated attacks |
+| `skipSuccessfulRequests` | `false` | All attempts count, not just failures — prevents "try until success" bypass |
+| Standard headers | `true` | Returns `RateLimit-*` headers so clients can implement backoff |
+| Test environment | Skipped | Rate limiter is bypassed when `NODE_ENV=test` so test suites don't collide |
+
+Redis is deliberately excluded. An in-memory store is accurate enough for a single-process deployment and adds no infrastructure dependency. If the application is ever deployed behind multiple processes, the limiter can be backed by Redis by swapping the store option.
+
+---
+
+### Logout
+
+`POST /api/auth/logout` calls `res.clearCookie(AUTH_COOKIE)` unconditionally. Because JWTs are stateless, there is no server-side session to invalidate. The cookie is cleared whether or not the caller is currently logged in (idempotent). Short token expiry (`7d`) limits the window during which a stolen token remains valid after logout — token revocation lists are out of scope at this stage.
+
+---
+
+### Error response shape
+
+All auth errors follow the project-wide format:
+
+```json
+{ "status": "error", "message": "..." }
+```
+
+Validation errors additionally include an `errors` field with per-field details (from Zod). `500` errors suppress the original message to prevent internal detail leakage.
